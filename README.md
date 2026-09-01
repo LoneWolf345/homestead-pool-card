@@ -36,7 +36,7 @@ gust_entity: sensor.weather_station_wind_gust
 weather_entity: weather.home
 sun_entity: sun.sun
 plates:
-  day:   { src: /local/pool/plate-lawn.jpg,  caption: The pool from the patio, the neighbors' roofs beyond the wall. }
+  day:   { src: /local/pool/plate-lawn.jpg,  caption: The pool from the patio, roofs beyond the wall. }
   night: { src: /local/pool/plate-night.jpg, caption: The pool by moonlight, the patio in shadow. }
   storm: { src: /local/pool/plate-storm.jpg, caption: The pool under a thunderhead, the sapling leaning away from it. }
 chores:
