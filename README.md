@@ -17,7 +17,7 @@ Read-only: tapping anything opens its more-info dialog.
 ## Requirements
 
 - A pool thermometer in Home Assistant (here a Govee H5109 float read through the Govee cloud by a `command_line` sensor). Give it `state_class: measurement` so statistics accrue; the card itself reads raw history (`history/history_during_period`).
-- Optional: outdoor temperature / UV / wind / gust sensors, a `weather` entity with an hourly forecast, `sun.sun`, and [Maintenance Supporter](https://github.com/) tasks for the pool.
+- Optional: outdoor temperature / UV / wind / gust sensors, a `weather` entity with an hourly forecast, `sun.sun`, and Maintenance Supporter tasks for the pool (any sensor exposing `days_until_due` / `next_due` and a `due_soon` / `overdue` state works).
 
 ## Installation (HACS)
 

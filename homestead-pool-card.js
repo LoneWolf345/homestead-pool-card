@@ -4,7 +4,7 @@
  * recorder history, a five-cell strip and the lifeguard's "Bathing notices". Read-only: tap →
  * more-info. Companion to almanac-weather-card / network-ledger-card / homestead-classifieds-card
  * / homestead-waterworks-card. */
-const HPC_VERSION = "2026.9.1";
+const HPC_VERSION = "2026.9.2";
 const INK = "#3a2d1f", PAPER = "#f3e7d3", TAN = "#a3876a", BROWN = "#7a6248",
   TERRA = "#c65f38", BLUE = "#5f7e94", DOT = "#cfb894", GREEN = "#2f7f6f";
 const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
@@ -26,9 +26,11 @@ const hourRange = (d) => { const h = d.getHours(), h1 = (h + 1) % 24; return ap(
 const floorHour = (d) => { const x = new Date(d); x.setMinutes(0, 0, 0); return x; };
 const monDay = (day) => { const [y, m, d] = day.split("-").map(Number); return `${MON3[m - 1]} ${d}`; };
 const degWord = (n) => (n === 1 ? "a degree" : `${n} degrees`);
+const dateOnly = (s) => String(s ?? "").slice(0, 10); // "2026-09-14T00:00:00+00:00" → "2026-09-14"
 
 class HomesteadPoolCard extends HTMLElement {
   static getStubConfig() { return { water_entity: "sensor.pool_temperature", air_entity: "sensor.weather_station_temperature", weather_entity: "weather.home" }; }
+  constructor() { super(); this._subSeq = 0; this._fetchSeq = 0; }
 
   setConfig(config) {
     if (!config || !config.water_entity) throw new Error("homestead-pool-card: set water_entity (the pool thermometer)");
@@ -47,6 +49,7 @@ class HomesteadPoolCard extends HTMLElement {
     this._cfg = c;
     if (!this.shadowRoot) this.attachShadow({ mode: "open" });
     this._sig = null; this._hist = null; this._histAt = 0; this._histDay = ""; this._last = null; this._dayAgo = null; this._fc = null;
+    this._fetchSeq++; this._fetching = false; // an in-flight history fetch for the old config is discarded when it lands
     this._dropSub();
     if (this._fontsReady === undefined) {
       const fonts = typeof document !== "undefined" && document.fonts;
@@ -63,25 +66,34 @@ class HomesteadPoolCard extends HTMLElement {
   // ---------- data ----------
   _st(id) { const s = id && this._hass && this._hass.states[id]; return s && !bad(s.state) ? s : null; }
   _val(id) { const s = this._st(id); return s ? num(s.state) : null; }
-  _dropSub() { if (this._unsub) { try { this._unsub(); } catch (e) { /* gone */ } } this._unsub = null; this._subKey = null; }
+  // Bumping _subSeq discards any subscribe still in its WS round-trip: when it resolves, the
+  // token no longer matches and the fresh unsubscribe is called at once instead of being orphaned.
+  _dropSub() { this._subSeq++; if (this._unsub) { try { this._unsub(); } catch (e) { /* gone */ } } this._unsub = null; this._subKey = null; }
   _maybeSubscribe() {
     const ent = this._cfg && this._cfg.weather_entity, conn = this._hass && this._hass.connection;
     if (!ent || !conn || !conn.subscribeMessage || this._subKey === ent) return;
     this._subKey = ent;
+    const my = ++this._subSeq;
     try {
-      conn.subscribeMessage((m) => { this._fc = (m && m.forecast) || []; this._sig = null; this._render(); },
+      conn.subscribeMessage((m) => { if (my !== this._subSeq) return; this._fc = (m && m.forecast) || []; this._sig = null; this._render(); },
         { type: "weather/subscribe_forecast", entity_id: ent, forecast_type: "hourly" })
-        .then((u) => { this._unsub = u; }).catch(() => { this._subKey = null; });
+        .then((u) => {
+          if (my !== this._subSeq || !this.isConnected) { try { u(); } catch (e) { /* gone */ } if (my === this._subSeq) this._subKey = null; return; }
+          this._unsub = u;
+        })
+        .catch(() => { if (my === this._subSeq) this._subKey = null; });
     } catch (e) { this._subKey = null; }
   }
   async _maybeFetchHistory() {
     const day = ymd(new Date());
     if (this._fetching || !this._hass || !this._hass.callWS || (Date.now() - this._histAt < 30 * 60000 && this._histDay === day)) return;
     this._fetching = true;
+    const seq = this._fetchSeq, ent = this._cfg.water_entity;
     try {
       const start = new Date(); start.setHours(0, 0, 0, 0); start.setDate(start.getDate() - this._cfg.days);
-      const r = await this._hass.callWS({ type: "history/history_during_period", start_time: start.toISOString(), entity_ids: [this._cfg.water_entity], minimal_response: true, no_attributes: true, significant_changes_only: false });
-      const rows = (r && r[this._cfg.water_entity]) || [];
+      const r = await this._hass.callWS({ type: "history/history_during_period", start_time: start.toISOString(), entity_ids: [ent], minimal_response: true, no_attributes: true, significant_changes_only: false });
+      if (seq !== this._fetchSeq) return; // setConfig ran while we waited: these rows belong to the old config
+      const rows = (r && r[ent]) || [];
       const byDay = new Map(); let last = null, dayAgo = null; const cut = Date.now() / 1000 - 86400;
       for (const x of rows) {
         const v = num(x.s); if (v == null || x.lu == null) continue;
@@ -94,7 +106,7 @@ class HomesteadPoolCard extends HTMLElement {
       this._last = last; this._dayAgo = dayAgo;
       this._histAt = Date.now(); this._histDay = day; this._sig = null; this._render();
     } catch (e) { /* keep the last rows */ }
-    finally { this._fetching = false; }
+    finally { if (seq === this._fetchSeq) this._fetching = false; }
   }
   _water() {
     const s = this._st(this._cfg.water_entity);
@@ -208,13 +220,13 @@ class HomesteadPoolCard extends HTMLElement {
       const s = this._st(ch.entity); if (!s) continue;
       const a = s.attributes || {};
       let days = num(a.days_until_due);
-      if (days == null && a.next_due) { const d = new Date(a.next_due + "T00:00:00"); days = Math.round((d - new Date(ymd(now) + "T00:00:00")) / 86400000); }
+      if (days == null && a.next_due) { const d = new Date(dateOnly(a.next_due) + "T00:00:00"); days = Math.round((d - new Date(ymd(now) + "T00:00:00")) / 86400000); }
       if (days == null) continue;
       const item = { name: ch.name || ch.entity, entity: ch.entity, days, due: s.state === "due_soon" || s.state === "overdue" || days <= 0, next: a.next_due };
       if (!best || item.days < best.days) best = item;
     }
     if (!best) return null;
-    const d = best.days, dow = best.next ? new Date(best.next + "T00:00:00").getDay() : null;
+    const d = best.days, dow = best.next ? new Date(dateOnly(best.next) + "T00:00:00").getDay() : null;
     const when = d < 0 ? `overdue ${-d} day${-d === 1 ? "" : "s"}` : d === 0 ? "due today" : d === 1 ? "due tomorrow" : `due ${dow != null ? DAY3[dow] : "in " + d + " days"}${dow != null ? ` (${d} days)` : ""}`;
     const owed = d < 0 ? "already" : d === 0 ? "today" : d === 1 ? "by tomorrow" : dow != null ? `by ${DAYS[dow]}` : `in ${d} days`;
     return Object.assign(best, { row: `${best.name} · ${when}`, lede: best.due ? `The ${best.name.toLowerCase()} is owed ${owed}. ` : "" });
@@ -377,10 +389,11 @@ class HomesteadPoolCard extends HTMLElement {
   }
 }
 
-if (!document.getElementById("hwc-font") && !document.getElementById("hpc-font")) {
+// One font link shared by every Homestead Times card (same id + URL in each; first to load wins).
+if (!document.getElementById("homestead-times-font")) {
   const l = document.createElement("link");
-  l.id = "hpc-font"; l.rel = "stylesheet";
-  l.href = "https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;0,9..144,700;0,9..144,900;1,9..144,400&family=Archivo:wght@400;600;700&display=swap";
+  l.id = "homestead-times-font"; l.rel = "stylesheet";
+  l.href = "https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;0,9..144,700;0,9..144,900;1,9..144,400&family=Archivo:wght@400;500;600;700&display=swap";
   document.head.appendChild(l);
 }
 customElements.define("homestead-pool-card", HomesteadPoolCard);

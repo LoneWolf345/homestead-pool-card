@@ -1,7 +1,8 @@
 // smoke.mjs — node harness for homestead-pool-card
 import fs from "node:fs"; import vm from "node:vm";
 const src = fs.readFileSync(new URL("./homestead-pool-card.js", import.meta.url), "utf8");
-class HTMLElement { constructor() { this._sr = null; this.style = {}; this._h = 700; } attachShadow() { this._sr = { innerHTML: "", querySelectorAll: () => [], querySelector: () => null }; return this._sr; } get shadowRoot() { return this._sr; } dispatchEvent() {} getBoundingClientRect() { return { height: this._h }; } }
+// Shim: `sets` counts shadowRoot.innerHTML writes (render-dedupe check); isConnected is what a mounted card sees.
+class HTMLElement { constructor() { this._sr = null; this.style = {}; this._h = 700; this.isConnected = true; this.sets = 0; } attachShadow() { const el = this; let html = ""; this._sr = { get innerHTML() { return html; }, set innerHTML(v) { html = v; el.sets++; }, querySelectorAll: () => [], querySelector: () => null }; return this._sr; } get shadowRoot() { return this._sr; } dispatchEvent() {} getBoundingClientRect() { return { height: this._h }; } }
 const defs = {}; const store = new Map();
 const localStorage = { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)) };
 // A clock we can set: the card only ever calls new Date() / Date.now() for "now".
@@ -51,7 +52,8 @@ function ymd(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart
 const cfg = () => ({ water_entity: "sensor.pool_temperature", air_entity: "sensor.weather_station_temperature", uv_entity: "sensor.weather_station_uv_index", wind_entity: "sensor.weather_station_wind_speed", gust_entity: "sensor.weather_station_wind_gust", weather_entity: "weather.home", sun_entity: "sun.sun",
   plates: { day: { src: "/local/pool/plate-lawn.jpg", caption: "The pool on its lawn." }, night: { src: "/local/pool/plate-night.jpg", caption: "By moonlight." }, storm: { src: "/local/pool/plate-storm.jpg", caption: "Under a thunderhead." } },
   chores: [{ name: "Chlorine", entity: "sensor.pool_add_chlorine" }, { name: "Filter clean", entity: "sensor.pool_clean_pool_filter" }] });
-const make = async (states, c, fc) => { const el = new Card(); el.setConfig(c || cfg()); el.hass = { states, callWS: history, connection: conn(fc || forecast()) }; await tick(); await tick(); return el; };
+// three ticks (90 ms): the card's _remember timer fires 60 ms after the loaded render, so two ticks raced it
+const make = async (states, c, fc) => { const el = new Card(); el.setConfig(c || cfg()); el.hass = { states, callWS: history, connection: conn(fc || forecast()) }; await tick(); await tick(); await tick(); return el; };
 const DAY3 = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"], DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
 check("card registered", typeof Card === "function");
@@ -113,5 +115,25 @@ check("setConfig rejects missing water_entity", (() => { try { new Card().setCon
   store.set("hpc-h:sensor.pool_temperature", "812");
   const el2 = new Card(); el2.setConfig(cfg()); el2.hass = { states: base(), callWS: () => new Promise(() => {}), connection: conn(forecast()) }; await tick();
   check("history pending: reserves remembered height", el2.style.minHeight === "812px"); }
+
+// ---- hostile strings go through esc(): never raw in the shadow root ----
+{ const c = cfg(); c.title = "<img src=x onerror=alert(1)>"; c.chores = [{ name: "<img src=x onerror=alert(1)>", entity: "sensor.pool_add_chlorine" }];
+  const el = await make(base(), c); const h = el.shadowRoot.innerHTML;
+  check("hostile title + chore name escaped, never raw", (h.match(/&lt;img src=x onerror=alert\(1\)&gt;/g) || []).length >= 2 && !h.includes("<img src=x")); }
+
+// ---- primary entity unavailable and no history at all: renders, no error shell, no NaN/undefined ----
+{ const st = base(); st["sensor.pool_temperature"] = S("unavailable"); let h = "", threw = false;
+  try { const el = new Card(); el.setConfig(cfg()); el.hass = { states: st, callWS: async () => ({}), connection: conn(forecast()) }; await tick(); await tick(); h = el.shadowRoot.innerHTML; } catch (e) { threw = true; }
+  check("unavailable water + empty history: no throw, no NaN/undefined", !threw && h.includes("No reading from the deep end") && h.includes("presumed adrift") && !h.includes("color:#b00") && !/NaN|undefined/.test(h)); }
+
+// ---- render dedupe: the identical hass twice writes innerHTML once ----
+{ const c = cfg(); c.weather_entity = ""; const el = new Card(); el.setConfig(c); const H = { states: base(), callWS: () => new Promise(() => {}) };
+  el.hass = H; el.hass = H; await tick();
+  check("render dedupe: same hass twice → one innerHTML write", el.sets === 1); }
+
+// ---- F3: a subscribe that resolves after the card was dropped is unsubscribed at once ----
+{ let unsubbed = false; const late = { subscribeMessage: () => new Promise((r) => setTimeout(() => r(() => { unsubbed = true; }), 10)) };
+  const el = new Card(); el.setConfig(cfg()); el.hass = { states: base(), callWS: history, connection: late }; el.disconnectedCallback(); await tick(40);
+  check("subscribe resolving after disconnect is unsubscribed, nothing stored", unsubbed && el._unsub === null && el._subKey === null); }
 
 console.log(fails ? `\n${fails} FAILED` : "\nall passed"); process.exit(fails ? 1 : 0);
